@@ -9,8 +9,6 @@ import streamlit as st
 
 from scheduler.pipeline import run
 
-TEMPLATE = Path(__file__).parent / "templates" / "Pharmacist Schedule Template.xlsx"
-
 st.set_page_config(page_title="Pharmacist Scheduler", page_icon="🗓️", layout="centered")
 
 st.title("Pharmacist Scheduler")
@@ -18,13 +16,6 @@ st.write(
     "Upload your schedule workbook. Everything you've already entered is kept; "
     "the program fills the blank cells and gives you back a finished copy to download."
 )
-
-if TEMPLATE.exists():
-    with st.expander("Need the template?"):
-        st.write("Start from this workbook. Its **Instructions** sheet explains each sheet "
-                 "and how to add pharmacists, roles and codes.")
-        st.download_button("Download the blank template", TEMPLATE.read_bytes(), file_name=TEMPLATE.name,
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 upload = st.file_uploader("Schedule workbook (.xlsx)", type=["xlsx"])
 
@@ -74,8 +65,9 @@ if r:
     if not r["ok"]:
         st.error(r["message"])
         if "Couldn't find a cell labeled" in r["message"]:
-            st.warning("This doesn't look like a schedule workbook. Start from the blank template "
-                       "under **Need the template?** above.")
+            st.warning("This doesn't look like a schedule workbook. Upload the department's "
+                       "schedule template (the workbook with the Schedule, Aptitude, Requirements "
+                       "and Settings sheets).")
         for cat, msg in r["errors"]:
             st.markdown(f"- **{cat}**: {msg}")
         st.info("Fix these in the workbook and upload it again. Your file hasn't been changed.")
