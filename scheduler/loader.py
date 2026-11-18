@@ -63,7 +63,10 @@ class Template:
     apt_sheet: str | None = None
     apt_row: dict[str, int] = field(default_factory=dict)       # pid -> row
     dpp_col: int | None = None
+    apt_pid_col: int | None = None
+    apt_prn_col: int | None = None
     req_sheet: str | None = None
+    req_role_col: int | None = None
     req_row: dict[str, int] = field(default_factory=dict)       # role -> row
     req_day_col: dict[int, int] = field(default_factory=dict)   # weekday -> column
     row_of: dict[str, int] = field(default_factory=dict)
@@ -850,6 +853,6 @@ def load_template(path: str | Path, sheet: str | None = None, year: int | None =
                     settings_source=settings_source, code_styles=code_styles, style_book=book, codes=codes,
                     shift_times=shift_times,
                     sheet_name=s_sheet, row_of=row_of,
-                    apt_sheet=a_sheet, apt_row=apt_row, dpp_col=dpp_col,
-                    req_sheet=r_sheet, req_row=req_row, req_day_col=dict(day_cols),
+                    apt_sheet=a_sheet, apt_row=apt_row, dpp_col=dpp_col, apt_pid_col=ac, apt_prn_col=prn_col,
+                    req_sheet=r_sheet, req_row=req_row, req_day_col=dict(day_cols), req_role_col=role_col,
                     col_of=dict(zip(dates, date_cols)), grid=g)

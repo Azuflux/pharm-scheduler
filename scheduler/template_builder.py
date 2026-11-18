@@ -87,8 +87,11 @@ INSTRUCTIONS = [
           "formulas: they update as you type codes on the Schedule or change targets (Aptitude) and "
           "requirements (Requirements), so you can see the effect of a change before running the program "
           "again. Green = exactly right, red = short, yellow = over; in Shifts Fulfilled, gray = an optional "
-          "role left open, purple = a PRN was requested on the last run and hasn't been entered yet. The "
-          "program rebuilds both blocks on every run, so don't type inside them."),
+          "role left open, purple = a PRN was requested on the last run and hasn't been entered yet. Each "
+          "pharmacist's row finds its target on Aptitude by the PID in that row (shown in the Target "
+          "column), and each Shifts Fulfilled row finds its numbers on Requirements by role name, so "
+          "you can move or sort rows on any sheet. The program rebuilds both blocks on every run, so "
+          "don't type inside them."),
     ("h", "Sharing top-aptitude work"),
     ("p", "For each role, pharmacists scored at the Settings' balance level (4 by default) share that "
           "role's shifts as evenly as the other rules allow over the whole schedule; for example, two "

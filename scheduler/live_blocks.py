@@ -49,8 +49,12 @@ class Layout:
     day_row: int
     pid_col: int                                 # column holding PIDs ("Date"/"Day" labels)
     name_col: int | None                         # left Name column, if any
-    dpp_ref: dict[str, str] = field(default_factory=dict)          # pid -> "'Aptitude'!$C$5"
-    req_ref: dict[tuple[str, int], str] = field(default_factory=dict)  # (role, weekday) -> ref
+    # Lookup ranges (keyed by PID / role name, so rows can be reordered on any sheet)
+    apt_pid_rng: str | None = None               # "'Aptitude'!$B:$B"
+    apt_dpp_rng: str | None = None
+    apt_prn_rng: str | None = None
+    req_role_rng: str | None = None
+    req_day_rng: dict[int, str] = field(default_factory=dict)       # weekday -> range
 
     @property
     def first_row(self) -> int:
@@ -120,38 +124,50 @@ def clear_block_formatting(ws, below_row: int, from_col: int) -> None:
 
 # --------------------------------------------------------------------------- days / target
 
+def _prn_flag(pid_rng: str, prn_rng: str | None, key: str) -> str:
+    """Formula: >0 when this PID is marked PRN (same yes-words the program accepts)."""
+    if not prn_rng:
+        return "0"
+    return "+".join(f"COUNTIFS({pid_rng},{key},{prn_rng},{c})"
+                    for c in ('"y*"', '"x"', '"on"', '"true"', "1"))
+
+
 def write_days_block(t: Template, lay: Layout, base_font: Font) -> dict[str, object]:
-    """Right-hand block. Returns {cell: expected value} for the cached results."""
+    """Right-hand block: Name | Target | each pay period | Total. Every row looks its target up by
+    the PID in its own row, so pharmacists can be moved around on either sheet.
+    Returns {cell: expected value} for the cached results."""
     ws = lay.ws
     fname, fsize = base_font.name or "Calibri", base_font.sz or 11
     name_col = lay.last_col + 1
+    tgt_col = name_col + 1
     periods = t.periods()
-    tot_c = name_col + len(periods) + 1
+    tot_c = tgt_col + len(periods) + 1
     nonpay = [c for c, info in t.codes.items() if not info["counts_for_pay"]]
+    ppd = t.settings.pay_period_days
+    assign = _assign(t)
     cached: dict[str, object] = {}
 
     def count_expr(rng: str) -> str:
         return f"SUMPRODUCT(--(LEN(TRIM({rng}))>0))" + "".join(f"-COUNTIF({rng},{_crit(c)})" for c in nonpay)
 
-    head = ws.cell(lay.date_row, name_col, config.LABEL_NAME)
-    head.font = Font(name=fname, sz=fsize, b=True)
-    ws.column_dimensions[L(name_col)].width = 22
+    def header(c, top, sub, width=11):
+        h = ws.cell(lay.date_row, c, top)
+        h.font, h.alignment = Font(name=fname, sz=fsize, b=True), CENTER
+        if c != name_col:
+            h.fill = FILL["header"]
+        d = ws.cell(lay.day_row, c, sub)
+        d.font, d.alignment = Font(name=fname, sz=max(7, fsize - 2), i=True), CENTER
+        ws.column_dimensions[L(c)].width = width
+
+    header(name_col, config.LABEL_NAME, None, 22)
+    header(tgt_col, "Target", "per period", 9)
     pcols = []
     for k, per in enumerate(periods, 1):
-        c = name_col + k
         cols = [lay.date_cols[d] for d in per["dates"]]
         pcols.append((per, min(cols), max(cols)))
         lbl = f"{per['start'].month}/{per['start'].day}-{per['end'].month}/{per['end'].day}"
-        h = ws.cell(lay.date_row, c, lbl + ("" if per["complete"] else " (partial)"))
-        h.font, h.alignment, h.fill = Font(name=fname, sz=fsize, b=True), CENTER, FILL["header"]
-        d = ws.cell(lay.day_row, c, "days/target")
-        d.font, d.alignment = Font(name=fname, sz=max(7, fsize - 2), i=True), CENTER
-        ws.column_dimensions[L(c)].width = 11
-    h = ws.cell(lay.date_row, tot_c, "Total")
-    h.font, h.alignment, h.fill = Font(name=fname, sz=fsize, b=True), CENTER, FILL["header"]
-    d = ws.cell(lay.day_row, tot_c, "days/target")
-    d.font, d.alignment = Font(name=fname, sz=max(7, fsize - 2), i=True), CENTER
-    ws.column_dimensions[L(tot_c)].width = 11
+        header(tgt_col + k, lbl + ("" if per["complete"] else " (partial)"), "days/target")
+    header(tot_c, "Total", "days/target")
 
     # PRN STAFF separator rows: carry the band across
     if lay.name_col:
@@ -163,56 +179,75 @@ def write_days_block(t: Template, lay: Layout, base_font: Font) -> dict[str, obj
                 lab = ws.cell(r, name_col, config.LABEL_PRN_SECTION)
                 lab.font = copy(left.font)
 
-    ratio_cells = []
+    def tgt_for(n_days: int, tref: str) -> str:
+        return tref if n_days == ppd else f"ROUND({tref}*{n_days}/{ppd},0)"
+
     for pid, r in lay.staff_rows.items():
         s = t.staff.get(pid)
-        nm = ws.cell(r, name_col, (s.name if s and s.name else pid))
+        key = f"${L(lay.pid_col)}{r}"
+        tref = f"${L(tgt_col)}{r}"
+        # name, mirrored from the left so it follows the row
+        nm = ws.cell(r, name_col)
+        src = f"${L(lay.name_col)}{r}" if lay.name_col else key
+        nm.value = f'=IF({src}="","",{src})'
         nm.font = Font(name=fname, sz=fsize, b=True)
-        has_target = bool(s and s.target_days and not s.prn and pid in lay.dpp_ref)
-        tparts = []
-        for k, (per, c1, c2) in enumerate(pcols, 1):
-            cell = ws.cell(r, name_col + k)
-            cell.alignment, cell.border = CENTER, GRID
-            cnt = count_expr(f"{L(c1)}{r}:{L(c2)}{r}")
-            n = sum(1 for d in per["dates"] if (pid, d) in _assign(t)
-                    and t.code_counts_for_pay(_assign(t)[pid, d]))
-            if not has_target:
-                cell.value = f'=IF(({cnt})=0,"",{cnt})'
-                cell.font = Font(name=fname, sz=fsize, color="808080")
-                cached[cell.coordinate] = n if n else ""
-                continue
-            ref = lay.dpp_ref[pid]
-            tgt = ref if per["complete"] else f"ROUND({ref}*{len(per['dates'])}/{t.settings.pay_period_days},0)"
-            tparts.append(tgt)
-            cell.value = f'={cnt}&"/"&{tgt}'
-            cell.font = Font(name=fname, sz=fsize, b=True)
-            target = s.target_days if per["complete"] else round(
-                s.target_days * len(per["dates"]) / t.settings.pay_period_days)
-            cached[cell.coordinate] = f"{n}/{target}"
-            ratio_cells.append(cell)
-        cell = ws.cell(r, tot_c)
-        cell.alignment, cell.border = CENTER, GRID
-        full = f"{L(lay.first_col)}{r}:{L(lay.last_col)}{r}"
-        n_all = sum(1 for d in t.dates if (pid, d) in _assign(t) and t.code_counts_for_pay(_assign(t)[pid, d]))
-        if has_target:
-            cell.value = f'={count_expr(full)}&"/"&({"+".join(tparts)})'
-            cell.font = Font(name=fname, sz=fsize, b=True)
-            tot_t = sum(s.target_days if per["complete"] else round(
-                s.target_days * len(per["dates"]) / t.settings.pay_period_days) for per, _, _ in pcols)
-            cached[cell.coordinate] = f"{n_all}/{tot_t}"
+        if lay.name_col:
+            v = ws.cell(r, lay.name_col).value
+            cached[nm.coordinate] = "" if v in (None, "") else str(v)
         else:
-            cell.value = f'=IF(({count_expr(full)})=0,"",{count_expr(full)})'
-            cell.font = Font(name=fname, sz=fsize, color="808080")
-            cached[cell.coordinate] = n_all if n_all else ""
+            cached[nm.coordinate] = pid
+        # target, looked up by PID
+        tc = ws.cell(r, tgt_col)
+        tc.alignment, tc.border = CENTER, GRID
+        tc.font = Font(name=fname, sz=fsize, i=True, color="595959")
+        if lay.apt_pid_rng and lay.apt_dpp_rng:
+            tc.value = (f'=IF({key}="","",IF(COUNTIF({lay.apt_pid_rng},{key})=0,"no PID",'
+                        f'IF(({_prn_flag(lay.apt_pid_rng, lay.apt_prn_rng, key)})>0,"PRN",'
+                        f'SUMIF({lay.apt_pid_rng},{key},{lay.apt_dpp_rng}))))')
+        else:
+            tc.value = ""
+        if s is None:
+            cached[tc.coordinate] = "no PID"
+        elif s.prn:
+            cached[tc.coordinate] = "PRN"
+        else:
+            cached[tc.coordinate] = s.target_days or 0
+        has_target = bool(s and s.target_days and not s.prn)
+        # per period and total
+        spans = [(tgt_col + k, f"{L(c1)}{r}:{L(c2)}{r}", per["dates"]) for k, (per, c1, c2) in enumerate(pcols, 1)]
+        spans.append((tot_c, f"{L(lay.first_col)}{r}:{L(lay.last_col)}{r}", t.dates))
+        for c, rng, dates in spans:
+            cell = ws.cell(r, c)
+            cell.alignment, cell.border = CENTER, GRID
+            cell.font = Font(name=fname, sz=fsize, b=True)
+            cnt = count_expr(rng)
+            if c == tot_c:
+                tgt = "+".join(tgt_for(len(per["dates"]), tref) for per, _, _ in pcols)
+                n_t = sum(_scaled(s.target_days, len(per["dates"]), ppd) for per, _, _ in pcols) if has_target else 0
+            else:
+                tgt = tgt_for(len(dates), tref)
+                n_t = _scaled(s.target_days, len(dates), ppd) if has_target else 0
+            cell.value = (f'=IF(AND(ISNUMBER({tref}),N({tref})>0),({cnt})&"/"&({tgt}),'
+                          f'IF(({cnt})=0,"",{cnt}))')
+            n = sum(1 for d in dates if (pid, d) in assign and t.code_counts_for_pay(assign[pid, d]))
+            cached[cell.coordinate] = f"{n}/{n_t}" if has_target else (n if n else "")
 
-    rng = f"{L(name_col + 1)}{lay.first_row}:{L(tot_c)}{lay.last_row}"
-    _ratio_rules(ws, rng, f"{L(name_col + 1)}{lay.first_row}")
-    if lay.date_row > 1 and ws.cell(lay.date_row - 1, name_col + 1).value in (None, ""):
-        note = ws.cell(lay.date_row - 1, name_col + 1,
-                       "Days given / target, updating as you edit (PTO counts). Green = met, red = short, "
-                       "yellow = over. Gray = PRN or no target.")
+    rng = f"{L(tgt_col + 1)}{lay.first_row}:{L(tot_c)}{lay.last_row}"
+    _ratio_rules(ws, rng, f"{L(tgt_col + 1)}{lay.first_row}",
+                 prefix_rules=[FormulaRule(
+                     formula=[f'AND(LEN({L(tgt_col + 1)}{lay.first_row})>0,'
+                              f'ISERROR(FIND("/",{L(tgt_col + 1)}{lay.first_row})))'],
+                     font=Font(color="808080", b=False), stopIfTrue=True)])
+    if lay.date_row > 1 and ws.cell(lay.date_row - 1, tgt_col + 1).value in (None, ""):
+        note = ws.cell(lay.date_row - 1, tgt_col + 1,
+                       "Days given / target, updating as you edit (PTO counts). Each row finds its target "
+                       "on Aptitude by PID. Green = met, red = short, yellow = over. Gray = PRN or no target.")
         note.font = Font(name=fname, sz=max(7, fsize - 2), i=True, color="595959")
     return cached
+
+
+def _scaled(target, n_days: int, ppd: int) -> int:
+    return target if n_days == ppd else round(target * n_days / ppd)
 
 
 # --------------------------------------------------------------------------- shifts fulfilled
@@ -276,7 +311,8 @@ def write_fulfilled_block(t: Template, lay: Layout, start: int, base_font: Font,
         for d, c in lay.date_cols.items():
             col = L(c)
             have = "+".join(f"COUNTIF({col}${r1}:{col}${r2},{_crit(code)})" for code in covers[role])
-            need = lay.req_ref.get((role, d.weekday()), "0")
+            need = (f"SUMIF({lay.req_role_rng},${L(label_col)}{r},{lay.req_day_rng[d.weekday()]})"
+                    if lay.req_role_rng and d.weekday() in lay.req_day_rng else "0")
             cell = ws.cell(r, c)
             cell.alignment = CENTER
             cell.font = Font(name=fname, sz=fsize)
@@ -379,10 +415,25 @@ def add_live_blocks(t: Template, wb, ws, assignment: dict, prn_requests=(), with
             row += n          # the inserted rows pushed same-sheet inputs down
         return sheet_ref(None if same else sheet, row, c0 + 1)
 
-    if t.dpp_col is not None:
-        lay.dpp_ref = {p: ref(t.apt_sheet, r, t.dpp_col) for p, r in t.apt_row.items()}
-    lay.req_ref = {(role, wd): ref(t.req_sheet, r, c)
-                   for role, r in t.req_row.items() for wd, c in t.req_day_col.items()}
+    def col_rng(sheet, rows0, c0):
+        """Whole column on its own sheet (survives inserts and reordering); on the schedule's
+        own sheet (older one-sheet layout), just the block's rows."""
+        if c0 is None:
+            return None
+        if sheet != t.sheet_name:
+            return f"{sheet_ref(sheet, 1, c0 + 1).split('!')[0]}!${L(c0 + 1)}:${L(c0 + 1)}"
+        a, b = ref(sheet, min(rows0), c0), ref(sheet, max(rows0), c0)
+        return f"{a}:{b}"
+
+    if t.apt_row and t.apt_pid_col is not None:
+        rows0 = list(t.apt_row.values())
+        lay.apt_pid_rng = col_rng(t.apt_sheet, rows0, t.apt_pid_col)
+        lay.apt_dpp_rng = col_rng(t.apt_sheet, rows0, t.dpp_col)
+        lay.apt_prn_rng = col_rng(t.apt_sheet, rows0, t.apt_prn_col)
+    if t.req_row and t.req_role_col is not None:
+        rows0 = list(t.req_row.values())
+        lay.req_role_rng = col_rng(t.req_sheet, rows0, t.req_role_col)
+        lay.req_day_rng = {wd: col_rng(t.req_sheet, rows0, c) for wd, c in t.req_day_col.items()}
     cached = {}
     cached.update(write_days_block(t, lay, base_font))
     cached.update(write_fulfilled_block(t, lay, start, base_font, prn_requests, with_prn_row))

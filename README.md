@@ -85,8 +85,10 @@ sheets and the old Shifts Fulfilled table are replaced.
 ## Live checks
 The days/target columns and the Shifts Fulfilled table are Excel formulas (in the template and
 in every output), so editing a code on the Schedule, a target on Aptitude or a count on
-Requirements updates them immediately: you can test a change before re-running. Results are
-also stored in the file, so it previews correctly and can be re-uploaded without being opened
+Requirements updates them immediately: you can test a change before re-running. Inputs are
+looked up by key: each pharmacist row finds its target on Aptitude by its own PID, and each
+Shifts Fulfilled row finds its requirement by role name, so rows can be moved or sorted on any
+sheet. Results are also stored in the file, so it previews correctly and can be re-uploaded without being opened
 in Excel first. Purple in Shifts Fulfilled marks a PRN slot requested by the last run that hasn't
 been entered yet; it turns green once a PRN's row has that code. The blocks are rebuilt on every
 run; after adding a pharmacist or role, rebuild them without solving with
