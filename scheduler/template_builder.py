@@ -14,6 +14,7 @@ from . import config
 from copy import copy
 from collections import Counter
 
+from .live_blocks import refresh_file
 from .loader import Template, cell_style, style_signature, write_applied_styles
 from .settings import SPEC as SETTINGS_SPEC, display_value
 
@@ -45,7 +46,9 @@ INSTRUCTIONS = [
           "each role's coverage per day: red means a required role was not covered. The Summary, Pay "
           "Periods, Role Counts, Coverage Gaps and Rule Check sheets explain the result."),
     ("n", "5. To adjust, edit cells in the output and run it again. Everything already in the "
-          "schedule is kept, so you can lock in the parts you like and re-run the rest."),
+          "schedule is kept, so you can lock in the parts you like and re-run the rest. The days/target "
+          "columns and the Shifts Fulfilled table recalculate as you type, so you can see what an edit "
+          "does before you re-run (see Live checks while you edit)."),
     ("h", "The sheets"),
     ("b", "Schedule"),
     ("p", "One row per pharmacist (Name, then PID), one column per date. Each cell holds a code: a role "
@@ -78,6 +81,14 @@ INSTRUCTIONS = [
     ("p", "The program never schedules anyone for more days than their Days Per Pay Period. If someone "
           "asks for an extra day, type it on the Schedule: entries you type are always kept, and the "
           "program fills around them."),
+    ("h", "Live checks while you edit"),
+    ("p", "Right of the dates, each pharmacist's days given / target per pay period and in total; under "
+          "the schedule, the Shifts Fulfilled table (filled / required for every role and day). Both are "
+          "formulas: they update as you type codes on the Schedule or change targets (Aptitude) and "
+          "requirements (Requirements), so you can see the effect of a change before running the program "
+          "again. Green = exactly right, red = short, yellow = over; in Shifts Fulfilled, gray = an optional "
+          "role left open, purple = a PRN was requested on the last run and hasn't been entered yet. The "
+          "program rebuilds both blocks on every run, so don't type inside them."),
     ("h", "Sharing top-aptitude work"),
     ("p", "For each role, pharmacists scored at the Settings' balance level (4 by default) share that "
           "role's shifts as evenly as the other rules allow over the whole schedule; for example, two "
@@ -109,7 +120,10 @@ INSTRUCTIONS = [
     ("b", "Add a pharmacist"),
     ("p", "Add a row at the bottom of the Schedule sheet (Name, PID) and a row at the bottom of the "
           "Aptitude sheet with the same PID, their days per pay period and a score for every role. PIDs "
-          "must be unique; the PID is what connects the two sheets."),
+          "must be unique; the PID is what connects the two sheets. On the Schedule sheet, insert a "
+          "row (right-click a row number, Insert) rather than typing into the blank row above Shifts "
+          "Fulfilled, so the table stays one row below the list. The live checks pick up the new person on the next run (or use 'Only update the live "
+          "checks' in the web app)."),
     ("b", "Remove a pharmacist"),
     ("p", "Delete their row on both the Schedule and Aptitude sheets. To keep them listed but stop "
           "scheduling them, set Days Per Pay Period to 0."),
@@ -117,7 +131,8 @@ INSTRUCTIONS = [
     ("p", "On the Aptitude sheet, add a column at the right end with the new role code in row 2 and a "
           "score for every pharmacist. On the Requirements sheet, add a row with the same code and the "
           "number needed each day, and format its Color cell. Inserting whole rows or columns is safe on these sheets, as long as "
-          "no blank row or column is left inside a table."),
+          "no blank row or column is left inside a table. The Shifts Fulfilled table gets a row for the new "
+          "role on the next run (or use 'Only update the live checks')."),
     ("b", "Remove a role"),
     ("p", "Delete its column on the Aptitude sheet and its row on the Requirements sheet. Make sure the "
           "code no longer appears on the Schedule."),
@@ -218,14 +233,13 @@ DEFAULT_LOOK = {
 }
 
 
-def build_template(t: Template, out_path: str | Path, look: dict | None = None) -> Path:
-    out_path = Path(out_path)
-    wb = openpyxl.Workbook()
-    styles = {**learn_styles(t), **{k: v for k, v in t.code_styles.items()}}  # Color cells win
-
-    # ---------------- Instructions
-    ins = wb.active
-    ins.title = config.INSTRUCTIONS_SHEET
+def write_instructions(ins) -> None:
+    """(Re)write the Instructions sheet text."""
+    for row in list(ins.iter_rows()):
+        for cell in row:
+            cell.value = None
+            cell.font = Font()
+            ins.row_dimensions[cell.row].height = None
     ins.column_dimensions["A"].width = 110
     r = 1
     for kind, text in INSTRUCTIONS:
@@ -242,6 +256,17 @@ def build_template(t: Template, out_path: str | Path, look: dict | None = None) 
         lines = max(1, len(text) // 105 + 1)
         ins.row_dimensions[r].height = 15 * lines + 2
         r += 1
+
+
+def build_template(t: Template, out_path: str | Path, look: dict | None = None) -> Path:
+    out_path = Path(out_path)
+    wb = openpyxl.Workbook()
+    styles = {**learn_styles(t), **{k: v for k, v in t.code_styles.items()}}  # Color cells win
+
+    # ---------------- Instructions
+    ins = wb.active
+    ins.title = config.INSTRUCTIONS_SHEET
+    write_instructions(ins)
 
     # ---------------- Schedule
     lk = {**DEFAULT_LOOK, **(look or {})}
@@ -468,4 +493,17 @@ def build_template(t: Template, out_path: str | Path, look: dict | None = None) 
     write_applied_styles(wb, styles)
     wb.active = wb.sheetnames.index("Schedule")
     wb.save(out_path)
+    refresh_file(out_path)       # live days/target and Shifts Fulfilled blocks
     return out_path
+
+
+def refresh_template(path: str | Path, out_path: str | Path | None = None) -> Path:
+    """Bring an existing template (or schedule) up to date without solving: current Instructions
+    text plus freshly built live check blocks. Keeps the sheet's look and every entry."""
+    path = Path(path)
+    out_path = Path(out_path or path)
+    wb = openpyxl.load_workbook(path)
+    if config.INSTRUCTIONS_SHEET in wb.sheetnames:
+        write_instructions(wb[config.INSTRUCTIONS_SHEET])
+    wb.save(out_path)
+    return refresh_file(out_path)

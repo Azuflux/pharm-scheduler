@@ -18,6 +18,7 @@ from . import config
 from .loader import (Issue, Template, cell_str, cell_style, read_applied_styles,
                      legacy_style_signature, style_signature, write_applied_styles)
 from .model import Solution
+from .live_blocks import add_live_blocks, inject_cached_values, remove_old_blocks
 from .settings import SPEC as SETTINGS_SPEC, display_value
 
 FILLS = {
@@ -35,6 +36,7 @@ FILLS = {
     "optional_open": PatternFill("solid", fgColor="E7E6E6"),
     "prn": PatternFill("solid", fgColor="7030A0"),
 }
+BOLD = Font(bold=True)
 PRN_FONT = Font(bold=True, color="FFFFFF")
 PRN_ROW_LABEL = "PRN NEEDED"
 
@@ -44,115 +46,27 @@ def _prn_text(reqs: list[tuple[str, int]]) -> str:
     return ", ".join(f"{n} {r}" if n > 1 else r for r, n in reqs)
 
 
-def _remove_old_fulfilled_block(ws) -> None:
-    """If the template is a previous output, delete its Shifts Fulfilled block first."""
-    target = config.LABEL_SHIFTS_FULFILLED.lower()
-    for row in ws.iter_rows():
-        for cell in row:
-            if isinstance(cell.value, str) and cell.value.strip().lower() == target:
-                r, c = cell.row, cell.column
-                n = 0
-                while ws.cell(r + n, c).value not in (None, ""):
-                    n += 1
-                if ws.cell(r + n, c).value in (None, ""):
-                    n += 1  # trailing blank row we added
-                ws.delete_rows(r, n)
-                return
-
-
-def _write_fulfilled_block(t: Template, sol: Solution, ws) -> tuple[int, int]:
-    """Insert the Shifts Fulfilled matrix under the schedule. Returns (met, short) counts
-    for required role-days."""
-    label_col = min(t.col_of.values())  # dates start one column right of the label column
-    label_col = label_col - 1
-    last_sched = max(t.row_of.values()) + 1           # 1-based Excel row of last pharmacist
-    roles = list(t.requirements)
-    show_prn_row = bool(t.prn_pids) or bool(sol.prn_requests)
-    # Layout: schedule / blank / title / [PRN NEEDED] / role rows / legend / blank / (input matrices)
-    block = 1 + int(show_prn_row) + len(roles) + 1 + 1
-    start = last_sched + 2
-    if all(ws.cell(last_sched + 1, c + 1).value in (None, "") for c in [label_col, *t.col_of.values()]):
-        ws.insert_rows(start, block)              # reuse the existing blank row above
-    else:
-        ws.insert_rows(last_sched + 1, block + 1)  # add the blank row above too
-
-    counts: dict[tuple[str, date], int] = {}
+def _coverage_counts(t: Template, sol: Solution) -> tuple[int, int, int]:
+    """(required role-days met, required role-days short, PRN shifts requested)."""
+    have: dict = {}
     for (p, d), code in sol.assignment.items():
         role = t.covered_role(code)
         if role:
-            counts[(role, d)] = counts.get((role, d), 0) + 1
+            have[(role, d)] = have.get((role, d), 0) + 1
     prn = {(r, d): n for r, d, n in sol.prn_requests}
-
-    center = Alignment(horizontal="center")
-    title = ws.cell(start, label_col + 1, config.LABEL_SHIFTS_FULFILLED)
-    title.font = BOLD
-    letter = get_column_letter(label_col + 1)
-    ws.column_dimensions[letter].width = max(ws.column_dimensions[letter].width or 0, 16)
-    for d, c in t.col_of.items():
-        h = ws.cell(start, c + 1, f"{d.month}/{d.day}")
-        h.font = BOLD
-        h.alignment = center
-        h.fill = FILLS["header"]
-
-    if show_prn_row:
-        pr = start + 1
-        lab = ws.cell(pr, label_col + 1, PRN_ROW_LABEL)
-        lab.font, lab.fill = PRN_FONT, FILLS["prn"]
-        for d, c in t.col_of.items():
-            reqs = [(r_, n) for (r_, dd), n in sorted(prn.items()) if dd == d]
-            cell = ws.cell(pr, c + 1)
-            cell.alignment = center
-            if reqs:
-                cell.value = _prn_text(reqs)
-                cell.fill, cell.font = FILLS["prn"], PRN_FONT
-
-    met = short = prn_slots = 0
-    first_role_row = start + 1 + int(show_prn_row)
-    for i, role in enumerate(roles):
-        r = first_role_row + i
-        ws.cell(r, label_col + 1, role).font = BOLD
-        optional = role in t.optional_roles
-        for d, c in t.col_of.items():
-            need, have = t.required(role, d), counts.get((role, d), 0)
-            n_prn = prn.get((role, d), 0)
-            cell = ws.cell(r, c + 1)
-            cell.alignment = center
-            if need == 0 and have == 0:
+    met = short = 0
+    for role in t.requirements:
+        if role in t.optional_roles:
+            continue
+        for d in t.dates:
+            need = t.required(role, d)
+            if not need:
                 continue
-            cell.value = f"{have}/{need}"
-            if n_prn:
-                cell.value = f"{have}+{n_prn} PRN/{need}" if have else f"PRN {n_prn}/{need}"
-                cell.fill, cell.font = FILLS["prn"], PRN_FONT
-                prn_slots += n_prn
-                if have + n_prn < need and role not in t.optional_roles:
-                    cell.fill = FILLS["short"]
-                    short += 1
-                continue
-            if have > need:
-                cell.fill = FILLS["over"]
-            elif have == need:
-                cell.fill = FILLS["met"]
-                met += 0 if optional else 1
-            elif optional:
-                cell.fill = FILLS["optional_open"]
-            else:
-                cell.fill = FILLS["short"]
-                cell.font = Font(bold=True, color="FFFFFF")
+            if have.get((role, d), 0) >= need:
+                met += 1
+            elif have.get((role, d), 0) + prn.get((role, d), 0) < need:
                 short += 1
-    # match the schedule's font (name and size) in the whole block
-    first = ws.cell(min(t.row_of.values()) + 1, min(t.col_of.values()) + 1).font
-    for rr in range(start, first_role_row + len(roles)):
-        for cc in [label_col, *t.col_of.values()]:
-            cell = ws.cell(rr, cc + 1)
-            f = copy(cell.font)
-            f.name, f.sz = first.name or f.name, first.sz or f.sz
-            cell.font = f
-    ws.cell(first_role_row + len(roles), label_col + 1,
-            "filled/required. Red = requirement not met; purple = a PRN is needed (see PRN NEEDED "
-            "and the PRN Requests sheet); gray = optional role left open; yellow = more than "
-            "required (filled in).").font = Font(italic=True, size=9)
-    return met, short, prn_slots
-BOLD = Font(bold=True)
+    return met, short, sum(prn.values())
 
 
 def _fill_for(t: Template, pid: str, code: str) -> PatternFill:
@@ -169,119 +83,6 @@ def _apply_code_style(t: Template, cell, code: str) -> None:
     cell.fill = copy(st["fill"])
     f = copy(st["font"])
     cell.font = f
-
-
-def _clear_right_block(t: Template, ws) -> None:
-    """Remove a right-hand name / days block left by an earlier run (output fed back in)."""
-    date_row = min(t.row_of.values()) - 1          # Excel row of the Date header
-    first = max(t.col_of.values()) + 2            # Excel column right after the last date
-    if str(ws.cell(date_row, first).value or "").strip().lower() != config.LABEL_NAME.lower():
-        return
-    last = first
-    while ws.cell(date_row, last + 1).value not in (None, ""):
-        last += 1
-    for r in range(max(1, date_row - 1), max(t.row_of.values()) + 2):
-        for c in range(first, last + 1):
-            cell = ws.cell(r, c)
-            cell.value = None
-            cell.fill = PatternFill(fill_type=None)
-            cell.font = Font()
-            cell.border = Border()
-
-
-def _write_right_block(t: Template, sol: Solution, ws) -> int:
-    """Name again, then days given / target per pay period and in total, right of the dates.
-    Returns how many pharmacist-periods are short of target."""
-    first_staff = min(t.row_of.values()) + 1
-    date_row, day_row = first_staff - 2, first_staff - 1
-    name_col = max(t.col_of.values()) + 2
-    base = ws.cell(first_staff, min(t.col_of.values()) + 1).font
-    fname, fsize = base.name or "Calibri", base.sz or 11
-    thin = Side(style="thin", color="BFBFBF")
-    grid = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center")
-    periods = t.periods()
-
-    head = ws.cell(date_row, name_col, config.LABEL_NAME)
-    head.font = Font(name=fname, sz=fsize, b=True)
-    sub = ws.cell(day_row, name_col, "")
-    for k, per in enumerate(periods, 1):
-        c = name_col + k
-        lbl = f"{per['start'].month}/{per['start'].day}-{per['end'].month}/{per['end'].day}"
-        h = ws.cell(date_row, c, lbl + ("" if per["complete"] else " (partial)"))
-        h.font, h.alignment, h.fill = Font(name=fname, sz=fsize, b=True), center, FILLS["header"]
-        d = ws.cell(day_row, c, "days/target")
-        d.font, d.alignment = Font(name=fname, sz=max(7, fsize - 2), i=True), center
-        ws.column_dimensions[get_column_letter(c)].width = 11
-    tot_c = name_col + len(periods) + 1
-    h = ws.cell(date_row, tot_c, "Total")
-    h.font, h.alignment, h.fill = Font(name=fname, sz=fsize, b=True), center, FILLS["header"]
-    d = ws.cell(day_row, tot_c, "days/target")
-    d.font, d.alignment = Font(name=fname, sz=max(7, fsize - 2), i=True), center
-    ws.column_dimensions[get_column_letter(tot_c)].width = 11
-    ws.column_dimensions[get_column_letter(name_col)].width = 22
-
-    # PRN STAFF separator rows: repeat the label and band on the right
-    left_name_col = min(t.col_of.values()) - 1        # Excel column of the left Name column
-    for r in range(first_staff, max(t.row_of.values()) + 2):
-        if left_name_col < 1:
-            break
-        left = ws.cell(r, left_name_col)
-        if str(left.value or "").strip().upper() == config.LABEL_PRN_SECTION:
-            for c in range(name_col, tot_c + 1):
-                ws.cell(r, c).fill = copy(left.fill)
-            lab = ws.cell(r, name_col, config.LABEL_PRN_SECTION)
-            lab.font = copy(left.font)
-
-    short = 0
-    for pid, r0 in t.row_of.items():
-        r = r0 + 1
-        s = t.staff.get(pid)
-        nm = ws.cell(r, name_col, (s.name if s and s.name else pid))
-        nm.font = Font(name=fname, sz=fsize, b=True)
-        tot_n = tot_t = 0
-        has_target = bool(s and s.target_days and not s.prn)
-        for k, per in enumerate(periods, 1):
-            n = sum(1 for d in per["dates"] if (pid, d) in sol.assignment
-                    and t.code_counts_for_pay(sol.assignment[pid, d]))
-            cell = ws.cell(r, name_col + k)
-            cell.alignment, cell.border = center, grid
-            if not has_target:
-                cell.value = n if n else ""
-                cell.font = Font(name=fname, sz=fsize, color="808080")
-                continue
-            target = s.target_days if per["complete"] else round(
-                s.target_days * len(per["dates"]) / t.settings.pay_period_days)
-            cell.value = f"{n}/{target}"
-            cell.font = Font(name=fname, sz=fsize, b=True)
-            if n == target:
-                cell.fill = FILLS["met"]
-            elif n < target:
-                cell.fill, cell.font = FILLS["short"], Font(name=fname, sz=fsize, b=True, color="FFFFFF")
-                short += 1
-            else:
-                cell.fill = FILLS["over"]
-            tot_n += n
-            tot_t += target
-        cell = ws.cell(r, tot_c)
-        cell.alignment, cell.border = center, grid
-        if has_target:
-            cell.value = f"{tot_n}/{tot_t}"
-            cell.font = Font(name=fname, sz=fsize, b=True)
-            cell.fill = FILLS["met"] if tot_n == tot_t else FILLS["short"] if tot_n < tot_t else FILLS["over"]
-            if tot_n < tot_t:
-                cell.font = Font(name=fname, sz=fsize, b=True, color="FFFFFF")
-        else:
-            tot_all = sum(1 for d in t.dates if (pid, d) in sol.assignment
-                          and t.code_counts_for_pay(sol.assignment[pid, d]))
-            cell.value = tot_all if tot_all else ""
-            cell.font = Font(name=fname, sz=fsize, color="808080")
-    if date_row > 1 and ws.cell(date_row - 1, name_col + 1).value in (None, ""):
-        note = ws.cell(date_row - 1, name_col + 1,
-                       "Days given / target (PTO counts). Green = target met, red = short, "
-                       "yellow = over (typed-in days). Gray = PRN or no target.")
-        note.font = Font(name=fname, sz=max(7, fsize - 2), i=True, color="595959")
-    return short
 
 
 def _write_aptitude_view(t: Template, sol: Solution, wb) -> None:
@@ -347,8 +148,7 @@ def write_output(t: Template, sol: Solution, issues: list[Issue], out_path: str 
     if t.source.suffix.lower() in (".xlsx", ".xlsm"):
         wb = openpyxl.load_workbook(t.source)   # keeps formulas and formatting
         ws = wb[t.sheet_name] if t.sheet_name else wb.worksheets[0]
-        _remove_old_fulfilled_block(ws)
-        _clear_right_block(t, ws)
+        removed = remove_old_blocks(t, ws)
         for name in config.REPORT_SHEETS:          # output fed back in as a template
             if name in wb.sheetnames:
                 del wb[name]
@@ -362,6 +162,7 @@ def write_output(t: Template, sol: Solution, issues: list[Issue], out_path: str 
             if isinstance(wc.value, str) and wc.value.startswith("="):
                 wc.value = d.strftime("%a").upper()
     else:
+        removed = (0, 0)
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Schedule"
@@ -404,8 +205,10 @@ def write_output(t: Template, sol: Solution, issues: list[Issue], out_path: str 
                     cell.font = Font()
         write_applied_styles(wb, t.code_styles)
 
-    short_periods = _write_right_block(t, sol, ws)
-    met, short, prn_slots = _write_fulfilled_block(t, sol, ws)
+    cached = add_live_blocks(t, wb, ws, sol.assignment, sol.prn_requests,
+                             with_prn_row=bool(t.prn_pids) or bool(sol.prn_requests), removed=removed)
+    short_periods = sum(1 for r in sol.target_rows if r["deviation"] < 0)
+    met, short, prn_slots = _coverage_counts(t, sol)
     _write_aptitude_view(t, sol, wb)
     if t.source.suffix.lower() == ".csv":
         first_staff_row = min(t.row_of.values()) + 1
@@ -552,4 +355,5 @@ def write_output(t: Template, sol: Solution, issues: list[Issue], out_path: str 
     _table(ck, ["Level", "Category", "Detail"], rows or [["", "", "No issues"]])
 
     wb.save(out_path)
+    inject_cached_values(out_path, ws.title, cached)
     return out_path

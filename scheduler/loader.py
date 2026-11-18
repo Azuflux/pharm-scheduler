@@ -59,6 +59,13 @@ class Template:
     style_book: object = field(default=None, repr=False)   # openpyxl workbook the styles came from
     # Where things are in the sheet (0-based grid indices), so output can be written in place.
     sheet_name: str | None = None
+    # Where the inputs live (0-based), so output formulas can point at them
+    apt_sheet: str | None = None
+    apt_row: dict[str, int] = field(default_factory=dict)       # pid -> row
+    dpp_col: int | None = None
+    req_sheet: str | None = None
+    req_row: dict[str, int] = field(default_factory=dict)       # role -> row
+    req_day_col: dict[int, int] = field(default_factory=dict)   # weekday -> column
     row_of: dict[str, int] = field(default_factory=dict)
     col_of: dict[date, int] = field(default_factory=dict)
     grid: list[list] = field(default_factory=list, repr=False)
@@ -121,11 +128,13 @@ class Template:
 
 def read_grids(path: Path):
     """Every sheet as a rectangular list of rows, keyed by sheet name (None for a CSV), plus the
-    openpyxl workbook (formatting included) for .xlsx, else None.
+    openpyxl workbook (formatting included) for .xlsx, else None, plus the set of formula cells
+    that have no saved result (they read as blank; the loader only objects if it needs one).
     Values are raw (str/int/float/datetime/None). grid[r][c] is Excel cell (r+1, c+1)."""
     suffix = path.suffix.lower()
     grids: dict[str | None, list[list]] = {}
     wf = None
+    uncalc: set[tuple[str | None, int, int]] = set()   # formulas with no saved result (read as blank)
     if suffix == ".csv":
         with open(path, encoding="utf-8-sig", newline="") as fh:
             grids[None] = [list(r) for r in csv.reader(fh)]
@@ -133,7 +142,6 @@ def read_grids(path: Path):
         import openpyxl
         wb = openpyxl.load_workbook(path, data_only=True)
         wf = openpyxl.load_workbook(path, data_only=False)
-        uncalculated = []
         for ws in wb.worksheets:
             if ws.title in config.IGNORED_SHEETS:
                 continue
@@ -144,19 +152,14 @@ def read_grids(path: Path):
                     if v is None:
                         f = fws.cell(r + 1, c + 1).value
                         if isinstance(f, str) and f.startswith("="):
-                            uncalculated.append(f"{ws.title}!{cell_ref(r, c)}")
+                            uncalc.add((ws.title, r, c))
             grids[ws.title] = rows
-        if uncalculated:
-            shown = ", ".join(uncalculated[:5]) + (f" (+{len(uncalculated) - 5} more)" if len(uncalculated) > 5 else "")
-            raise LoaderError("This file has formulas without saved results (it was last saved by a "
-                              "program other than Excel). Open it in Excel, save, and try again. "
-                              f"Cells: {shown}")
     else:
         raise LoaderError(f"Unsupported file type '{suffix}'. Use .xlsx or .csv.")
     for k, rows in grids.items():
         width = max((len(r) for r in rows), default=0)
         grids[k] = [r + [None] * (width - len(r)) for r in rows]
-    return grids, wf
+    return grids, wf, uncalc
 
 
 def cell_str(v) -> str:
@@ -346,6 +349,8 @@ def _block_rows(grid, start_row: int, key_col: int, name_col: int | None = None)
         name = cell_str(grid[r][name_col]) if name_col is not None else ""
         if not key and not name:
             break
+        if config.LABEL_SHIFTS_FULFILLED.lower() in (key.lower(), name.lower()):
+            break  # the live Shifts Fulfilled block starts right under the last row
         if not key and config.LABEL_PRN_SECTION.lower() in (name.lower(), ""):
             r += 1
             continue  # "PRN STAFF" separator row
@@ -513,7 +518,8 @@ def load_template(path: str | Path, sheet: str | None = None, year: int | None =
     """Load a template. Blocks may sit on one sheet or on separate sheets; each is found by
     its label. `sheet` limits where the schedule ('Date' label) is looked for."""
     path = Path(path)
-    grids, book = read_grids(path)
+    grids, book, uncalc = read_grids(path)
+    used: list[tuple[str | None, list[int], list[int]]] = []   # (sheet, rows, cols) the loader reads
     issues: list[Issue] = []
     code_styles: dict[str, dict] = {}
 
@@ -559,8 +565,11 @@ def load_template(path: str | Path, sheet: str | None = None, year: int | None =
         _gap_after_rows(g, apt_rows[-1], ac,
                         lambda r, v: all(cell_str(g[r][c]).isdigit() for c in role_cols[:3]),
                         "aptitude matrix")
+    apt_row: dict[str, int] = {}
+    used.append((a_sheet, apt_rows, [ac, dpp_col, *role_cols] + ([prn_col] if prn_col is not None else [])))
     for r in apt_rows:
         pid = cell_str(g[r][ac])
+        apt_row[pid] = r
         if pid in staff:
             raise LoaderError(f"PID '{pid}' appears twice in the aptitude matrix ({_where(a_sheet, r, ac)}).")
         apt = {}
@@ -615,9 +624,12 @@ def load_template(path: str | Path, sheet: str | None = None, year: int | None =
     req_rows = _block_rows(g, rhdr + 1, role_col)
     if req_rows:
         _gap_after_rows(g, req_rows[-1], role_col, lambda r, v: v.upper() in canon, "requirement matrix")
+    req_row: dict[str, int] = {}
+    used.append((r_sheet, req_rows, [role_col, *day_cols.values()] + ([opt_col] if opt_col is not None else [])))
     for r in req_rows:
         raw_role = cell_str(g[r][role_col])
         role = canon.get(raw_role.upper(), raw_role)
+        req_row[role] = r
         if role in requirements:
             raise LoaderError(f"Role '{role}' appears twice in the requirement matrix ({_where(r_sheet, r, role_col)}).")
         counts = []
@@ -823,10 +835,21 @@ def load_template(path: str | Path, sheet: str | None = None, year: int | None =
                                 f"PID {pid} is '{nm}' on the schedule but '{st.name}' in the aptitude "
                                 f"matrix. Using '{st.name}'. (PID is what links the rows.)"))
 
+    used.append((s_sheet, [sr, day_row, *sched_rows], [sc, *date_cols]))
+    bad = sorted({_where(sh, r, c) for sh, rows, cols in used for r in rows for c in cols
+                  if (sh, r, c) in uncalc})
+    if bad:
+        shown = ", ".join(bad[:5]) + (f" (+{len(bad) - 5} more)" if len(bad) > 5 else "")
+        raise LoaderError("Some cells the program needs hold formulas without saved results (the file "
+                          "was last saved by a program other than Excel). Open it in Excel, save, "
+                          f"and try again. Cells: {shown}")
+
     return Template(source=path, dates=dates, staff=staff, schedule_order=order, roles=roles,
                     requirements=requirements, locked=locked, year_note=year_note, issues=issues,
                     settings=settings, optional_roles=optional_roles, role_descriptions=descriptions,
                     settings_source=settings_source, code_styles=code_styles, style_book=book, codes=codes,
                     shift_times=shift_times,
                     sheet_name=s_sheet, row_of=row_of,
+                    apt_sheet=a_sheet, apt_row=apt_row, dpp_col=dpp_col,
+                    req_sheet=r_sheet, req_row=req_row, req_day_col=dict(day_cols),
                     col_of=dict(zip(dates, date_cols)), grid=g)

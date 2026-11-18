@@ -7,7 +7,9 @@ from pathlib import Path
 
 import streamlit as st
 
+from scheduler.loader import LoaderError
 from scheduler.pipeline import run
+from scheduler.template_builder import refresh_template
 
 st.set_page_config(page_title="Pharmacist Scheduler", page_icon="🗓️", layout="centered")
 
@@ -24,12 +26,29 @@ with st.expander("Options"):
         "Search time (seconds)", min_value=0, max_value=600, value=0, step=30,
         help="0 uses the time on the workbook's Settings sheet. Longer can give a slightly better "
              "schedule; 60 is usually plenty, 180 for a final version.")
+    refresh_only = st.button(
+        "Only update the live checks (fill nothing)", use_container_width=True, disabled=not upload,
+        help="Rebuilds the days/target columns and the Shifts Fulfilled table, e.g. after adding a "
+             "pharmacist or a role, without changing the schedule.")
 
 # Forget an old result when a different file is chosen.
 file_key = (upload.name, upload.size) if upload else None
 if st.session_state.get("file_key") != file_key:
     st.session_state.pop("result", None)
     st.session_state["file_key"] = file_key
+
+if upload and refresh_only:
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / Path(upload.name).name
+        src.write_bytes(upload.getvalue())
+        out = Path(tmp) / f"{src.stem} - checks updated.xlsx"
+        try:
+            refresh_template(src, out)
+            st.session_state["result"] = {"ok": True, "refresh": True, "name": out.name,
+                                          "bytes": out.read_bytes()}
+        except LoaderError as e:
+            st.session_state["result"] = {"ok": False, "message": str(e), "errors": [],
+                                          "warnings": []}
 
 if upload and st.button("Build schedule", type="primary", use_container_width=True):
     with tempfile.TemporaryDirectory() as tmp:
@@ -71,6 +90,11 @@ if r:
         for cat, msg in r["errors"]:
             st.markdown(f"- **{cat}**: {msg}")
         st.info("Fix these in the workbook and upload it again. Your file hasn't been changed.")
+    elif r.get("refresh"):
+        st.success("Live checks updated. Nothing on the schedule was changed.")
+        st.download_button("Download the updated workbook", r["bytes"], file_name=r["name"],
+                           type="primary", use_container_width=True,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
         s = r["summary"]
         st.success(f"Done: {s['pharmacists']} pharmacists, {s['start']:%b %-d} – {s['end']:%b %-d, %Y}.")
