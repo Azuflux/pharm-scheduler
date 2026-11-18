@@ -149,6 +149,12 @@ def write_output(t: Template, sol: Solution, issues: list[Issue], out_path: str 
         wb = openpyxl.load_workbook(t.source)   # keeps formulas and formatting
         ws = wb[t.sheet_name] if t.sheet_name else wb.worksheets[0]
         removed = remove_old_blocks(t, ws)
+        # Blank-looking cells (spaces, non-breaking spaces pasted from Teams/Outlook) -> truly empty
+        for r0 in t.row_of.values():
+            for c0 in t.col_of.values():
+                cell = ws.cell(r0 + 1, c0 + 1)
+                if isinstance(cell.value, str) and not cell.value.replace("\u200b", "").strip():
+                    cell.value = None
         for name in config.REPORT_SHEETS:          # output fed back in as a template
             if name in wb.sheetnames:
                 del wb[name]

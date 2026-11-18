@@ -148,7 +148,8 @@ def write_days_block(t: Template, lay: Layout, base_font: Font) -> dict[str, obj
     cached: dict[str, object] = {}
 
     def count_expr(rng: str) -> str:
-        return f"SUMPRODUCT(--(LEN(TRIM({rng}))>0))" + "".join(f"-COUNTIF({rng},{_crit(c)})" for c in nonpay)
+        # CHAR(160) (non-breaking space, from pasting out of Teams/Outlook/web) counts as blank
+        return f'SUMPRODUCT(--(LEN(TRIM(SUBSTITUTE({rng},CHAR(160),"")))>0))' + "".join(f"-COUNTIF({rng},{_crit(c)})" for c in nonpay)
 
     def header(c, top, sub, width=11):
         h = ws.cell(lay.date_row, c, top)
